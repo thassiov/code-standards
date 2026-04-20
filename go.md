@@ -347,7 +347,7 @@ func defaults() *Config {
 
 // loadFile merges JSON file contents into cfg. Missing files are OK.
 func loadFile(cfg *Config, path string) error {
-    data, err := os.ReadFile(path) //nolint:gosec // path is config-sourced
+    data, err := os.ReadFile(path) // #nosec G304 -- path is config-sourced
     if errors.Is(err, os.ErrNotExist) {
         return nil
     }
@@ -1472,9 +1472,14 @@ Work through in order. Each step has a template earlier in this doc.
 - [ ] `go get github.com/spf13/cobra` (and any other deps you reference
       in the skeleton)
 - [ ] `go mod tidy`
+- [ ] Write at least one table-driven test (see §10). `make ci` runs
+      coverage; an empty test suite gives false reassurance.
 - [ ] Ensure `~/.local/bin` is on `$PATH` if you want `make install-local`
 - [ ] `make tools` to install dev tools (goimports, golangci-lint@v1.64.8, gosec)
-- [ ] First commit should run `make ci` clean before push
+- [ ] `git add . && git commit -m "initial commit"` — needed so
+      `git describe` produces something other than the `"dev"` fallback
+      for subsequent builds.
+- [ ] `make ci` should pass cleanly before push.
 
 ---
 
