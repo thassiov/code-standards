@@ -26,12 +26,10 @@ Not for shell scripts, one-shots, or experiments.
 │       └── main.go           # thin: just wires cobra, nothing else
 ├── internal/                  # everything that's not API surface
 │   ├── config/
-│   ├── logging/
 │   ├── db/                    # or state/, store/
 │   ├── <domain>/              # business logic, one dir per bounded area
 │   └── ...
 ├── pkg/                       # ONLY if anything is meant to be imported externally
-│   └── models/
 ├── api/                       # ONLY for HTTP services
 │   ├── handlers/
 │   ├── routes/
@@ -68,16 +66,17 @@ Rules:
 
 - `go.mod` module path: match the actual import prefix. For GitHub-hosted
   personal code, `github.com/<user>/<project>`.
-- **Go version: 1.25.x.** Pin in `.github/workflows/ci.yml` as
-  `GO_VERSION: '1.25'`. Bump by editing one place.
+- **Go version: 1.25.x.** The `go` directive in `go.mod` and
+  `GO_VERSION` in CI must match. If `go mod init` writes a newer version
+  (because your local toolchain is newer), edit `go.mod` back to `go 1.25`.
 - Core dependency set (don't re-evaluate per project):
   - `github.com/spf13/cobra` — CLI framework
   - `log/slog` (stdlib) — structured logging
   - `github.com/jackc/pgx/v5` — PostgreSQL client
   - `modernc.org/sqlite` — pure-Go SQLite (no CGO)
   - `github.com/go-chi/chi/v5` — HTTP router
-- Run `go mod tidy` on every PR. CI checks.
-- Vendor nothing unless you have a specific reason. `GOFLAGS=-mod=mod`.
+- Run `go mod tidy` on every PR. CI checks (non-mutating — see §12).
+- Don't vendor. Don't set `GOFLAGS` globally.
 
 ---
 
@@ -87,6 +86,7 @@ Every `cmd/<name>/main.go` follows this skeleton. Copy verbatim, change
 the `Use`, `Short`, and registered commands.
 
 ```go
+// Package main is the entry point for <binary-name>.
 package main
 
 import (
@@ -108,6 +108,7 @@ var (
 
 func main() {
     if err := run(); err != nil {
+        // Pre-logger error path — stderr is fine here.
         fmt.Fprintf(os.Stderr, "error: %v\n", err)
         os.Exit(1)
     }
@@ -131,10 +132,12 @@ func run() error {
     return rootCmd.ExecuteContext(ctx)
 }
 
+// newVersionCmd returns the `version` subcommand.
 func newVersionCmd() *cobra.Command {
     return &cobra.Command{
         Use:   "version",
         Short: "Print version information",
+        // Run (not RunE) is OK here — version has no failure mode.
         Run: func(_ *cobra.Command, _ []string) {
             fmt.Printf("version %s (built %s)\n", Version, BuildTime)
         },
@@ -148,17 +151,24 @@ Why `main() → run() → cobra`:
 - `SilenceUsage` / `SilenceErrors` on the root prevent Cobra from
   dumping usage text on every runtime failure.
 
+Note on unused params: Cobra's handler signature includes `*cobra.Command`
+and `[]string`. When you don't use one, write `_` instead of the name —
+the canonical lint config flags named-but-unused params via
+`revive:unused-parameter`.
+
 ---
 
 ## 4. Cobra patterns
 
-### 4.1 Subcommand factories
+### 4.1 Subcommand factories (shared state)
 
 Each subcommand is built by a `newXxxCmd()` function returning
 `*cobra.Command`. Keeps wiring declarative and lets `main.go` read
-like a table of contents.
+like a table of contents. For state shared with the parent (config
+path, logger), pass by pointer:
 
 ```go
+// newDaemonCmd returns the `daemon` subcommand.
 func newDaemonCmd(configPath *string) *cobra.Command {
     return &cobra.Command{
         Use:   "daemon",
@@ -166,8 +176,9 @@ func newDaemonCmd(configPath *string) *cobra.Command {
         RunE: func(cmd *cobra.Command, _ []string) error {
             cfg, err := config.Load(*configPath)
             if err != nil {
-                return err
+                return fmt.Errorf("loading config: %w", err)
             }
+            _ = cfg
             // use cmd.Context() for cancellation
             return nil
         },
@@ -175,15 +186,39 @@ func newDaemonCmd(configPath *string) *cobra.Command {
 }
 ```
 
+### 4.2 Subcommand factories (local flags)
+
+For flags scoped to one subcommand, declare the variable inside the
+factory and bind via a closure:
+
+```go
+// newGreetCmd returns the `greet --name <name>` subcommand.
+func newGreetCmd() *cobra.Command {
+    var name string
+
+    cmd := &cobra.Command{
+        Use:   "greet",
+        Short: "Greet someone",
+        RunE: func(_ *cobra.Command, _ []string) error {
+            fmt.Printf("Hello, %s!\n", name)
+            return nil
+        },
+    }
+    cmd.Flags().StringVar(&name, "name", "world", "who to greet")
+    return cmd
+}
+```
+
 Rules:
-- Prefer `RunE` over `Run` — errors propagate to `main()`.
+- Prefer `RunE` over `Run`. Exception: commands with no failure mode
+  (version, help).
 - Use `cmd.Context()` for ctx. Never a package-level global.
-- Pass shared flags by pointer (`configPath *string`), not global
-  vars, unless the flag is truly global (log level, verbose).
+- For shared state, pass by pointer through factory args.
+- For local flags, declare in the factory and bind via closure.
 - Global vars in `main.go` are OK *only* for genuinely global things
   (`verbose`, loaded `cfg`, `logger`). Never in business-logic packages.
 
-### 4.2 PersistentFlags + PersistentPreRunE
+### 4.3 PersistentFlags + PersistentPreRunE
 
 Put root-level flags on `PersistentFlags`; parse them once in
 `PersistentPreRunE`. **Skip setup for commands that don't need it**
@@ -191,6 +226,12 @@ Put root-level flags on `PersistentFlags`; parse them once in
 is missing.
 
 ```go
+// In run():
+var (
+    configPath string
+    verbose    bool
+)
+
 rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c",
     config.DefaultConfigPath(), "path to config file")
 rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false,
@@ -201,15 +242,27 @@ rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
     case "version", "help", "completion":
         return nil
     }
-    var err error
-    cfg, err = config.Load(configPath)
+    cfg, err := config.Load(configPath)
     if err != nil {
         return fmt.Errorf("loading config: %w", err)
     }
-    logger = logging.New(...)
+    level := slog.LevelInfo
+    if verbose {
+        level = slog.LevelDebug
+    }
+    logger := slog.New(slog.NewTextHandler(os.Stderr,
+        &slog.HandlerOptions{Level: level}))
+    logger.Info("configured", "machine_id", cfg.MachineID)
+    _ = cfg
     return nil
 }
 ```
+
+Gotcha: only the **deepest** `PersistentPreRunE` in a command chain
+runs. If a subcommand defines its own `PersistentPreRunE`, the root's
+is skipped — your config/logger setup won't happen. Either don't
+override on subcommands, or explicitly call the root's
+`PersistentPreRunE` from the override.
 
 ---
 
@@ -218,38 +271,58 @@ rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 One package (`internal/config`), one `Load()` function. Sources merge
 in order: **defaults → file → env vars** (later overrides earlier).
 
+The full package — runnable as-shown:
+
 ```go
-// internal/config/config.go
+// Package config loads and validates application configuration.
 package config
 
 import (
+    "encoding/json"
+    "errors"
     "fmt"
     "os"
     "path/filepath"
+    "strconv"
 )
 
+// Config is the top-level application configuration.
 type Config struct {
-    MachineID string
-    Scope     string
-    Postgres  PostgresConfig
-    // ...
+    MachineID string         `json:"machine_id"`
+    Scope     string         `json:"scope"`
+    Postgres  PostgresConfig `json:"postgres"`
 }
 
+// PostgresConfig describes a PostgreSQL connection.
 type PostgresConfig struct {
-    Host, User, Password, DB string
-    Port                     int
+    Host     string `json:"host"`
+    Port     int    `json:"port"`
+    User     string `json:"user"`
+    Password string `json:"password"`
+    DB       string `json:"db"`
 }
 
+// DSN returns the PostgreSQL connection string.
 func (p PostgresConfig) DSN() string {
     return fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
         p.User, p.Password, p.Host, p.Port, p.DB)
 }
 
+// ErrMissingConfig is returned when a required field is absent.
+var ErrMissingConfig = errors.New("missing required config")
+
+// DefaultConfigPath returns the default config file path
+// (~/.config/<binary-name>/config.json). Replace <binary-name>.
 func DefaultConfigPath() string {
-    home, _ := os.UserHomeDir()
+    home, err := os.UserHomeDir()
+    if err != nil {
+        return "config.json"
+    }
     return filepath.Join(home, ".config", "<binary-name>", "config.json")
 }
 
+// Load reads config from path, overlays env vars, and validates.
+// A missing file is OK (defaults are used); a malformed file is not.
 func Load(path string) (*Config, error) {
     cfg := defaults()
     if err := loadFile(cfg, path); err != nil {
@@ -261,6 +334,68 @@ func Load(path string) (*Config, error) {
     }
     return cfg, nil
 }
+
+func defaults() *Config {
+    return &Config{
+        Scope: "personal",
+        Postgres: PostgresConfig{
+            Host: "localhost",
+            Port: 5432,
+        },
+    }
+}
+
+// loadFile merges JSON file contents into cfg. Missing files are OK.
+func loadFile(cfg *Config, path string) error {
+    data, err := os.ReadFile(path) //nolint:gosec // path is config-sourced
+    if errors.Is(err, os.ErrNotExist) {
+        return nil
+    }
+    if err != nil {
+        return fmt.Errorf("reading: %w", err)
+    }
+    if err := json.Unmarshal(data, cfg); err != nil {
+        return fmt.Errorf("parsing json: %w", err)
+    }
+    return nil
+}
+
+// loadEnv overlays environment variables using the APP_ prefix.
+// Nested structs use underscore separation (e.g. APP_POSTGRES_HOST).
+// No reflection — explicit mapping is clearer and easier to debug.
+func loadEnv(cfg *Config) {
+    if v := os.Getenv("APP_MACHINE_ID"); v != "" {
+        cfg.MachineID = v
+    }
+    if v := os.Getenv("APP_SCOPE"); v != "" {
+        cfg.Scope = v
+    }
+    if v := os.Getenv("APP_POSTGRES_HOST"); v != "" {
+        cfg.Postgres.Host = v
+    }
+    if v := os.Getenv("APP_POSTGRES_PORT"); v != "" {
+        if p, err := strconv.Atoi(v); err == nil {
+            cfg.Postgres.Port = p
+        }
+    }
+    if v := os.Getenv("APP_POSTGRES_USER"); v != "" {
+        cfg.Postgres.User = v
+    }
+    if v := os.Getenv("APP_POSTGRES_PASSWORD"); v != "" {
+        cfg.Postgres.Password = v
+    }
+    if v := os.Getenv("APP_POSTGRES_DB"); v != "" {
+        cfg.Postgres.DB = v
+    }
+}
+
+// validate returns an error if cfg is incomplete or inconsistent.
+func validate(cfg *Config) error {
+    if cfg.Postgres.Host == "" {
+        return fmt.Errorf("postgres.host: %w", ErrMissingConfig)
+    }
+    return nil
+}
 ```
 
 Rules:
@@ -271,8 +406,14 @@ Rules:
   the URL themselves.
 - `Load()` validates and returns a complete config or an error. No
   partial configs escape into the wild.
+- **No reflection for env-var mapping.** Explicit per-field code is
+  more verbose but far easier to debug than a reflection-based layer.
+- Config file format is **JSON**. YAML if you have a reason; not by
+  default.
 - Secrets come from env vars or a secret manager. Never from a config
   file checked into git.
+- `APP_` prefix for env vars is convention; replace with project-specific
+  prefix (e.g. `WIDGETCTL_`) in real projects.
 
 ---
 
@@ -292,13 +433,16 @@ logger.Info("starting",
 ```
 
 Rules:
-- One logger created in `PersistentPreRunE` or at the top of a daemon's
-  run loop.
-- Pass logger **by value** into structs that need it. Don't stash
-  loggers in `context.Context` unless ctx is genuinely request-scoped
-  (HTTP handlers).
+- One logger constructed in `PersistentPreRunE` (for CLIs) or at the
+  top of a daemon's run loop.
+- **Pass as `*slog.Logger` (pointer).** Stdlib idiom. Don't copy
+  loggers by value.
+- Don't stash loggers in `context.Context` unless ctx is genuinely
+  request-scoped (HTTP handlers).
 - Handler choice: `TextHandler` for CLIs and local daemons,
-  `JSONHandler` for services shipping logs to a collector.
+  `JSONHandler` for services shipping logs to a collector. Note that
+  the two handlers emit different time formats — switching handler
+  types mid-project breaks log ingesters.
 - Log keys are lowercase snake_case: `machine_id`, `elapsed_ms`.
 - Levels: `Debug` (chatty, off by default), `Info` (normal),
   `Warn` (recoverable), `Error` (action needed). No custom levels.
@@ -312,10 +456,20 @@ Rules:
 
 ### 7.1 PostgreSQL (pgx v5)
 
-Use `pgxpool`. Wrap pool creation to inject logger and timeouts:
+Use `pgxpool`. Wrap pool creation to inject timeouts and validate the
+connection:
 
 ```go
-func Open(ctx context.Context, dsn string, logger *slog.Logger) (*pgxpool.Pool, error) {
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Open creates a Postgres connection pool and pings it.
+func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
     cfg, err := pgxpool.ParseConfig(dsn)
     if err != nil {
         return nil, fmt.Errorf("parsing DSN: %w", err)
@@ -335,35 +489,49 @@ func Open(ctx context.Context, dsn string, logger *slog.Logger) (*pgxpool.Pool, 
 }
 ```
 
+Shutdown: `pool.Close()` blocks on in-flight queries. Daemons should
+give it a bounded context via a goroutine + select or time out.
+
 ### 7.2 SQLite (modernc.org/sqlite, pure Go)
 
-Always set these pragmas. Without them, concurrent access (daemon +
-CLI, daemon + another reader) corrupts state:
+**Put pragmas in the DSN, not in `db.Exec(...)`.** A single `Exec`
+pragma only affects the one pooled connection that served it;
+subsequent connections revert to defaults and you're back to
+"database is locked". DSN pragmas apply to every connection opened
+by the pool.
 
 ```go
-func openSQLite(path string) (*sql.DB, error) {
-    dsn := fmt.Sprintf("file:%s", path)
+import (
+    "database/sql"
+    "fmt"
+
+    _ "modernc.org/sqlite" // registers "sqlite" driver
+)
+
+// OpenSQLite opens a SQLite database with WAL and busy-timeout pragmas
+// set on every pooled connection.
+func OpenSQLite(path string) (*sql.DB, error) {
+    dsn := fmt.Sprintf(
+        "file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)&_pragma=foreign_keys(on)",
+        path,
+    )
     db, err := sql.Open("sqlite", dsn)
     if err != nil {
         return nil, fmt.Errorf("opening sqlite %s: %w", path, err)
     }
-    if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-        db.Close()
-        return nil, fmt.Errorf("setting busy_timeout: %w", err)
-    }
-    if _, err := db.Exec("PRAGMA journal_mode = wal"); err != nil {
-        db.Close()
-        return nil, fmt.Errorf("setting journal_mode: %w", err)
-    }
     if err := db.Ping(); err != nil {
-        db.Close()
+        _ = db.Close()
         return nil, fmt.Errorf("pinging sqlite %s: %w", path, err)
     }
     return db, nil
 }
 ```
 
-For read-only opens, append `?mode=ro` to the DSN.
+For read-only opens, append `&mode=ro` to the DSN.
+
+Driver name gotcha: `modernc.org/sqlite` registers as `"sqlite"`, not
+`"sqlite3"` (which is mattn's CGO driver). `sql.Open("sqlite3", ...)`
+with only the modernc import fails with "unknown driver".
 
 ---
 
@@ -372,7 +540,17 @@ For read-only opens, append `?mode=ro` to the DSN.
 Use `go-chi/chi/v5`. Always set timeouts, always graceful-shutdown.
 
 ```go
-func New(addr string, handler http.Handler, logger *slog.Logger) *http.Server {
+import (
+    "context"
+    "errors"
+    "fmt"
+    "log/slog"
+    "net/http"
+    "time"
+)
+
+// NewServer constructs an http.Server with sane defaults.
+func NewServer(addr string, handler http.Handler) *http.Server {
     return &http.Server{
         Addr:              addr,
         Handler:           handler,
@@ -383,33 +561,68 @@ func New(addr string, handler http.Handler, logger *slog.Logger) *http.Server {
     }
 }
 
-// In run loop:
-go func() {
-    if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-        logger.Error("server stopped", "error", err)
+// Run starts srv and blocks until ctx is canceled, then gracefully shuts down.
+func Run(ctx context.Context, srv *http.Server, logger *slog.Logger) error {
+    errCh := make(chan error, 1)
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+            errCh <- err
+            return
+        }
+        errCh <- nil
+    }()
+
+    select {
+    case <-ctx.Done():
+        logger.Info("shutdown requested")
+    case err := <-errCh:
+        if err != nil {
+            return fmt.Errorf("server stopped: %w", err)
+        }
+        return nil
     }
-}()
 
-<-ctx.Done()
-
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-return srv.Shutdown(shutdownCtx)
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(shutdownCtx); err != nil {
+        return fmt.Errorf("shutdown: %w", err)
+    }
+    return nil
+}
 ```
 
 Handlers take dependencies as struct fields, not globals:
 
 ```go
+import (
+    "log/slog"
+    "net/http"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Handler groups HTTP handler dependencies.
 type Handler struct {
-    db     *pgxpool.Pool
-    logger *slog.Logger
+    DB     *pgxpool.Pool
+    Logger *slog.Logger
 }
 
-func (h *Handler) GetFoo(w http.ResponseWriter, r *http.Request) { ... }
+// GetFoo handles GET /foo.
+func (h *Handler) GetFoo(w http.ResponseWriter, _ *http.Request) {
+    _, _ = w.Write([]byte("ok"))
+}
 ```
 
-Middleware ordering:
+**Middleware order matters.** Canonical chain:
 `chi.RequestID → chi.RealIP → Logger → Recoverer → Timeout → routes`.
+
+`Recoverer` must go **before** `Timeout`. If a panic happens inside a
+timed-out handler and `Recoverer` comes after, the panic isn't caught
+and crashes the process.
+
+`Timeout` cancels the request context but does **not** cancel the
+handler's goroutine. If the handler does expensive work, check
+`r.Context().Done()` yourself.
 
 ---
 
@@ -472,14 +685,16 @@ Middleware ordering:
   `//go:build integration` tag, invoked via `go test -tags=integration`.
   May depend on `tests/docker-compose.yml`.
 - Always run with `-race` in CI. `go test -race ./...`.
-- No `testify` unless you genuinely need it. The stdlib is enough for
-  most assertions.
+- Stick to the stdlib `testing` package. No third-party assertion
+  libraries by default.
 
 ---
 
 ## 11. Linting — full `.golangci.yml`
 
-Copy this verbatim into `.golangci.yml` at repo root.
+Copy this verbatim into `.golangci.yml` at repo root. **Pin
+golangci-lint v1.64.x** in CI to match — v2 has a different schema
+and this config won't load there.
 
 ```yaml
 run:
@@ -490,8 +705,7 @@ linters:
   enable:
     # Bugs & correctness
     - govet
-    - staticcheck
-    - gosimple
+    - staticcheck       # also covers simple/stylecheck/unused checks
     - gosec
     - bodyclose
     - sqlclosecheck
@@ -519,7 +733,6 @@ linters:
     - gofmt
     - goimports
     - revive
-    - stylecheck
     - unconvert
     - unparam
     - misspell
@@ -623,57 +836,63 @@ issues:
         - dupl
         - unparam
 
-    # Allow fmt.Print in main
-    - path: cmd/
-      linters:
-        - forbidigo
-
-    # Dot imports in tests (e.g. for testify)
-    - path: _test\.go
-      text: "dot-imports"
-
-    # File paths from env/config are expected
-    - linters:
-        - gosec
-      text: "G304"
-
-    # wrapcheck and complexity are too strict for cobra commands
-    - path: cmd/
+    # Command-registration code is inherently long and has duplication
+    # across sibling newXxxCmd factories. Anchor regex with ^.
+    - path: ^cmd/
       linters:
         - wrapcheck
         - gocognit
         - gocyclo
+        - dupl
 
-    # Long-running state machines have inherent complexity;
-    # add paths for YOUR daemon/sync/state dirs here as they emerge.
-    # Example:
-    # - path: internal/(sync|extract)/
+    # main.go itself is long by nature (command registration)
+    - path: ^cmd/.*/main\.go
+      linters:
+        - funlen
+
+    # Long-running state machines have inherent complexity.
+    # Add paths for YOUR daemon/sync dirs as they emerge. Example:
+    # - path: ^internal/(sync|extract)/
     #   linters:
     #     - gocognit
     #     - nestif
 
-    # Command registration in main.go is inherently long
-    - path: cmd/.*/main\.go
-      linters:
-        - funlen
+    # File paths from env/config are expected — gosec G304 noise.
+    - linters:
+        - gosec
+      text: "G304"
 ```
 
-Notes:
-- Complexity budgets (`gocyclo: 15`, `funlen: 80/50`, `nestif: 4`) are
-  deliberately tight. If you're hitting them, the code probably needs
-  a rewrite, not an exemption.
-- Add per-path exemptions only when a specific pattern (e.g. a
-  state-machine loop) genuinely can't be simplified below the budget.
+Notes on the rule set:
+- **`staticcheck`** subsumes what `gosimple`, `stylecheck`, and the
+  `unused` check used to do separately — don't list the old names.
+- **Complexity budgets are tight on purpose.** If you hit them, the
+  code usually wants a rewrite, not an exemption. Add per-path
+  exemptions only when a specific pattern (e.g. a state-machine loop)
+  genuinely can't be simplified.
+- **All path exclusions use anchored regex (`^cmd/`)** so
+  `internal/foo/cmd/` doesn't accidentally match.
+- **`revive:exported`** will flag every exported type/func without a
+  doc comment. Comment everything you export — the discipline is worth
+  more than the lint bypass.
 
 ---
 
 ## 12. Build system — full `Makefile`
 
-Copy and replace `<binary-name>` everywhere.
+Copy and replace `<binary-name>` everywhere. The Makefile distinguishes
+**mutating** targets (run during local dev — `fmt`, `tidy`) from
+**check** targets (run in CI — `fmt-check`, `tidy-check`) so CI
+catches drift without rewriting files.
 
 ```make
-.PHONY: all build test lint coverage security check clean install-local install-local-force dev fmt tidy
-.PHONY: test-unit test-integration test-all ci docker-up docker-down help tools watch
+.PHONY: all build
+.PHONY: test test-unit test-integration test-all
+.PHONY: fmt tidy vet lint security coverage
+.PHONY: fmt-check tidy-check
+.PHONY: check ci
+.PHONY: docker-up docker-down
+.PHONY: clean install-local install-local-force dev watch tools help
 
 # Build configuration
 BINARY_DIR := bin
@@ -698,76 +917,122 @@ all: check build
 build:
 	@mkdir -p $(BINARY_DIR)
 	go build $(LDFLAGS) -o $(BINARY_DIR)/$(BINARY_NAME) $(MAIN_PACKAGE)
-	@echo "$(GREEN)Built: $(BINARY_DIR)/$(BINARY_NAME)$(NC)"
+	@printf '$(GREEN)Built: $(BINARY_DIR)/$(BINARY_NAME)$(NC)\n'
 
 # =============================================================================
 # Test
 # =============================================================================
 
+# -race is always on; catches bugs that only appear under contention.
 test-unit:
-	@echo "$(GREEN)Running unit tests...$(NC)"
-	go test -v -race ./...
-
-# Requires Docker; skip unless you have integration tests
-test-integration: docker-up
-	@echo "$(GREEN)Running integration tests...$(NC)"
-	cd tests && docker compose run --rm test-runner go test -v -tags=integration ./tests/integration/...
-	$(MAKE) docker-down
-
-test-all: test-unit test-integration
-	@echo "$(GREEN)All tests passed!$(NC)"
+	@printf '$(GREEN)Running unit tests...$(NC)\n'
+	go test -race -v ./...
 
 test: test-unit
 
+# Requires Docker + tests/docker-compose.yml; skip unless you have
+# integration tests. Runs cleanup even on failure.
+test-integration: docker-up
+	@printf '$(GREEN)Running integration tests...$(NC)\n'
+	@set -e; rc=0; \
+		(cd tests && docker compose run --rm test-runner \
+			go test -v -tags=integration ./integration/...) || rc=$$?; \
+		$(MAKE) docker-down; \
+		exit $$rc
+
+test-all: test-unit test-integration
+	@printf '$(GREEN)All tests passed!$(NC)\n'
+
 # =============================================================================
-# Code quality
+# Code quality — mutating (local dev)
 # =============================================================================
 
 fmt:
-	@echo "$(GREEN)Formatting code...$(NC)"
+	@printf '$(GREEN)Formatting code...$(NC)\n'
+	@if ! command -v goimports >/dev/null 2>&1; then \
+		printf '$(RED)goimports not installed. Run make tools.$(NC)\n'; exit 1; \
+	fi
 	go fmt ./...
-	@which goimports > /dev/null 2>&1 && goimports -w . || echo "$(YELLOW)goimports not installed, skipping$(NC)"
+	goimports -w .
 
 tidy:
 	go mod tidy
 
+# =============================================================================
+# Code quality — non-mutating (CI)
+# =============================================================================
+
+# Fails if any files need formatting. Lists offenders on stderr.
+fmt-check:
+	@printf '$(GREEN)Checking formatting...$(NC)\n'
+	@out=$$(gofmt -l .); \
+		if [ -n "$$out" ]; then \
+			printf '$(RED)Files need gofmt:$(NC)\n%s\n' "$$out"; exit 1; \
+		fi
+	@if command -v goimports >/dev/null 2>&1; then \
+		out=$$(goimports -l .); \
+		if [ -n "$$out" ]; then \
+			printf '$(RED)Files need goimports:$(NC)\n%s\n' "$$out"; exit 1; \
+		fi; \
+	fi
+
+# Fails if go.mod/go.sum would change after tidy.
+tidy-check:
+	@printf '$(GREEN)Checking go.mod/go.sum...$(NC)\n'
+	@go mod tidy
+	@if ! git diff --quiet -- go.mod go.sum 2>/dev/null; then \
+		printf '$(RED)go.mod or go.sum changed after tidy; run make tidy and commit.$(NC)\n'; \
+		git diff -- go.mod go.sum; exit 1; \
+	fi
+
+# =============================================================================
+# Static analysis (non-mutating)
+# =============================================================================
+
 vet:
-	@echo "$(GREEN)Running go vet...$(NC)"
+	@printf '$(GREEN)Running go vet...$(NC)\n'
 	go vet ./...
 
 lint:
-	@echo "$(GREEN)Running golangci-lint...$(NC)"
-	@which golangci-lint > /dev/null 2>&1 && golangci-lint run ./... || echo "$(YELLOW)golangci-lint not installed, running go vet instead$(NC)" && go vet ./...
+	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+		printf '$(RED)golangci-lint not installed. Run make tools.$(NC)\n'; exit 1; \
+	fi
+	@printf '$(GREEN)Running golangci-lint...$(NC)\n'
+	golangci-lint run ./...
 
 security:
-	@echo "$(GREEN)Running security checks...$(NC)"
-	@which gosec > /dev/null 2>&1 && gosec -quiet ./... || echo "$(YELLOW)gosec not installed, skipping$(NC)"
+	@if ! command -v gosec >/dev/null 2>&1; then \
+		printf '$(RED)gosec not installed. Run make tools.$(NC)\n'; exit 1; \
+	fi
+	@printf '$(GREEN)Running gosec...$(NC)\n'
+	gosec -quiet ./...
 
 coverage:
-	@echo "$(GREEN)Running tests with coverage...$(NC)"
-	go test -coverprofile=coverage.out -covermode=atomic ./...
-	@echo ""
-	@echo "$(GREEN)Coverage summary:$(NC)"
+	@printf '$(GREEN)Running tests with coverage...$(NC)\n'
+	go test -race -coverprofile=coverage.out -covermode=atomic ./...
+	@printf '\n$(GREEN)Coverage summary:$(NC)\n'
 	@go tool cover -func=coverage.out | grep -E "^total:|internal/"
-	@echo ""
 	@go tool cover -html=coverage.out -o coverage.html
-	@echo "$(GREEN)Full report: coverage.html$(NC)"
+	@printf '$(GREEN)Full report: coverage.html$(NC)\n'
 
 # =============================================================================
 # CI pipelines
 # =============================================================================
 
-ci: fmt tidy vet lint test-unit coverage build
-	@echo ""
-	@echo "$(GREEN)========================================$(NC)"
-	@echo "$(GREEN)  CI Pipeline completed successfully!  $(NC)"
-	@echo "$(GREEN)========================================$(NC)"
-
+# `check` is the fast local pipeline. Mutates files (fmt, tidy). Use
+# during active development.
 check: fmt tidy vet test-unit build
-	@echo "$(GREEN)Quick check passed!$(NC)"
+	@printf '$(GREEN)Quick check passed!$(NC)\n'
+
+# `ci` is the non-mutating pipeline. Use in CI and pre-push hooks.
+# Catches formatting/tidy drift that `check` would silently fix.
+ci: fmt-check tidy-check vet lint security test-unit coverage build
+	@printf '\n$(GREEN)========================================$(NC)\n'
+	@printf '$(GREEN)  CI Pipeline completed successfully!  $(NC)\n'
+	@printf '$(GREEN)========================================$(NC)\n'
 
 # =============================================================================
-# Docker (only if you have tests/docker-compose.yml)
+# Docker (only if tests/docker-compose.yml exists)
 # =============================================================================
 
 docker-up:
@@ -785,66 +1050,90 @@ clean:
 	rm -rf $(BINARY_DIR)
 	rm -f coverage.out coverage.html
 
+# Interactive install. Falls back to force-install under non-TTY.
 install-local: build
-	@mkdir -p ~/.local/bin
-	@if [ -x ~/.local/bin/$(BINARY_NAME) ]; then \
-		echo "$(YELLOW)Current:$(NC) $$(~/.local/bin/$(BINARY_NAME) version 2>/dev/null || echo 'unknown')"; \
-		echo "$(GREEN)New:$(NC)     $(BINARY_NAME) version $(VERSION) (built $(BUILD_TIME))"; \
-		echo ""; \
+	@mkdir -p $$HOME/.local/bin
+	@if [ ! -t 0 ]; then \
+		cp $(BINARY_DIR)/$(BINARY_NAME) $$HOME/.local/bin/; \
+		printf '$(GREEN)Installed to ~/.local/bin/$(BINARY_NAME) (non-interactive).$(NC)\n'; \
+		exit 0; \
+	fi; \
+	if [ -x $$HOME/.local/bin/$(BINARY_NAME) ]; then \
+		printf '$(YELLOW)Current:$(NC) %s\n' "$$($$HOME/.local/bin/$(BINARY_NAME) version 2>/dev/null || echo unknown)"; \
+		printf '$(GREEN)New:$(NC)     $(BINARY_NAME) version $(VERSION) (built $(BUILD_TIME))\n'; \
 		read -p "Replace existing installation? [y/N] " confirm; \
 		if [ "$$confirm" != "y" ] && [ "$$confirm" != "Y" ]; then \
-			echo "$(YELLOW)Cancelled$(NC)"; \
-			exit 1; \
+			printf '$(YELLOW)Cancelled$(NC)\n'; exit 1; \
 		fi; \
 	else \
-		echo "$(GREEN)Installing:$(NC) $(BINARY_NAME) version $(VERSION) (built $(BUILD_TIME))"; \
-	fi
-	cp $(BINARY_DIR)/$(BINARY_NAME) ~/.local/bin/
-	@echo "$(GREEN)Installed to ~/.local/bin/$(BINARY_NAME)$(NC)"
+		printf '$(GREEN)Installing:$(NC) $(BINARY_NAME) version $(VERSION) (built $(BUILD_TIME))\n'; \
+	fi; \
+	cp $(BINARY_DIR)/$(BINARY_NAME) $$HOME/.local/bin/; \
+	printf '$(GREEN)Installed to ~/.local/bin/$(BINARY_NAME)$(NC)\n'
 
 install-local-force: build
-	@mkdir -p ~/.local/bin
-	cp $(BINARY_DIR)/$(BINARY_NAME) ~/.local/bin/
-	@echo "$(GREEN)Installed to ~/.local/bin/$(BINARY_NAME)$(NC)"
+	@mkdir -p $$HOME/.local/bin
+	cp $(BINARY_DIR)/$(BINARY_NAME) $$HOME/.local/bin/
+	@printf '$(GREEN)Installed to ~/.local/bin/$(BINARY_NAME)$(NC)\n'
 
 dev: build
 	./$(BINARY_DIR)/$(BINARY_NAME)
 
+# Rebuild on change. Requires entr (https://eradman.com/entrproject/).
 watch:
+	@if ! command -v entr >/dev/null 2>&1; then \
+		printf '$(RED)entr not installed. See https://eradman.com/entrproject/.$(NC)\n'; exit 1; \
+	fi
 	find . -name '*.go' | entr -c make build
 
 tools:
-	@echo "$(GREEN)Installing development tools...$(NC)"
+	@printf '$(GREEN)Installing development tools...$(NC)\n'
 	go install golang.org/x/tools/cmd/goimports@latest
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
 	go install github.com/securego/gosec/v2/cmd/gosec@latest
 
 help:
 	@echo "Available targets:"
-	@echo "  build          Build the binary"
-	@echo "  install-local  Build and install to ~/.local/bin"
-	@echo "  test           Run unit tests (alias for test-unit)"
-	@echo "  test-unit      Run unit tests with race detector"
-	@echo "  test-integration  Run integration tests (requires Docker)"
-	@echo "  coverage       Generate coverage report"
-	@echo "  fmt            Format code"
-	@echo "  tidy           go mod tidy"
-	@echo "  vet            go vet"
-	@echo "  lint           golangci-lint"
-	@echo "  security       gosec"
-	@echo "  check          fmt + tidy + vet + test + build (fast local)"
-	@echo "  ci             Full CI pipeline"
-	@echo "  clean          Remove build artifacts"
-	@echo "  tools          Install dev tools"
-	@echo "  help           Show this help"
+	@echo "  build               Build the binary"
+	@echo "  install-local       Build and install to ~/.local/bin (TTY: confirm; non-TTY: force)"
+	@echo "  install-local-force Install without confirmation"
+	@echo "  test                Run unit tests (-race)"
+	@echo "  test-unit           Run unit tests (-race)"
+	@echo "  test-integration    Run integration tests (requires Docker)"
+	@echo "  coverage            Generate coverage report"
+	@echo "  fmt                 Format code (mutating)"
+	@echo "  tidy                go mod tidy (mutating)"
+	@echo "  fmt-check           Check formatting (non-mutating)"
+	@echo "  tidy-check          Check go.mod/go.sum (non-mutating)"
+	@echo "  vet                 go vet"
+	@echo "  lint                golangci-lint"
+	@echo "  security            gosec"
+	@echo "  check               fmt + tidy + vet + test + build (local, mutates)"
+	@echo "  ci                  Full non-mutating CI pipeline"
+	@echo "  dev                 Build and run"
+	@echo "  watch               Rebuild on change (requires entr)"
+	@echo "  clean               Remove build artifacts"
+	@echo "  tools               Install dev tools (goimports, golangci-lint@v1.64.8, gosec)"
+	@echo "  help                Show this help"
 ```
 
 **Ldflags for version injection are mandatory.** `<binary> version`
-should always print the real commit + build timestamp.
+should always print the real commit + build timestamp. Note: `git describe`
+silently falls back to `"dev"` if run outside a git repo — always run
+`git init` as the first checklist step.
+
+**`~/.local/bin` must be on `$PATH`** for `install-local` to be useful.
+Typical shell setup:
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ---
 
 ## 13. CI — full `.github/workflows/ci.yml`
+
+Every CI job maps 1:1 to a `make` target, so the Makefile is the single
+source of truth. CI and local behavior can't drift.
 
 ```yaml
 name: CI
@@ -857,8 +1146,46 @@ on:
 
 env:
   GO_VERSION: '1.25'
+  GOLANGCI_LINT_VERSION: 'v1.64.8'
 
 jobs:
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports@latest
+      - name: Check formatting
+        run: make fmt-check
+
+  tidy:
+    name: Tidy check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Check go.mod / go.sum
+        run: make tidy-check
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: make vet
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -871,8 +1198,21 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v4
         with:
-          version: latest
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --timeout=5m
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+      - run: make security
 
   test:
     name: Test
@@ -883,10 +1223,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Run tests
-        run: go test -v ./...
-      - name: Run tests with race detector
-        run: go test -race ./...
+      - run: make test-unit
 
   coverage:
     name: Coverage
@@ -898,12 +1235,16 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Generate coverage
-        run: go test -coverprofile=coverage.out -covermode=atomic ./...
+        run: make coverage
+      # Codecov upload is optional; requires CODECOV_TOKEN secret for
+      # private repos. Skipped when no token is set.
       - name: Upload coverage to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
           files: ./coverage.out
           fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   build:
     name: Build
@@ -917,28 +1258,22 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      # CGO off for cross-compile — modernc.org/sqlite is pure Go and
+      # no other dep needs CGO. If you add a CGO dep, handle per-arch
+      # toolchains explicitly instead of flipping this on.
       - name: Build
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
           go build -ldflags "-X main.Version=${{ github.sha }} -X main.BuildTime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
             -o dist/<binary-name>-linux-${{ matrix.goarch }} ./cmd/<binary-name>
-
-  security:
-    name: Security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/upload-artifact@v4
         with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-      - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
-      - name: Run gosec
-        run: gosec -quiet ./...
+          name: <binary-name>-linux-${{ matrix.goarch }}
+          path: dist/<binary-name>-linux-${{ matrix.goarch }}
 ```
 
 **`.github/workflows/release.yml`** (only needed when cutting versioned
@@ -968,10 +1303,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Run tests
-        run: go test -v ./...
-      - name: Run tests with race detector
-        run: go test -race ./...
+      - run: make test-unit
 
   release:
     name: Release
@@ -992,6 +1324,7 @@ jobs:
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
           go build -ldflags "-X main.Version=${{ github.ref_name }} -X main.BuildTime=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -1007,8 +1340,9 @@ jobs:
 
 ## 14. Service deployment (daemons only)
 
-For daemons that should run as a systemd user unit, include the
-install step in the Makefile. Template for the service file:
+For daemons that should run as a systemd user unit, include an install
+target in the Makefile that drops a unit file into
+`~/.config/systemd/user/`. Minimal template:
 
 ```ini
 [Unit]
@@ -1016,19 +1350,25 @@ Description=<one-line description>
 After=<dependency.service>
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=%h/.local/bin/<binary-name> daemon
 Restart=on-failure
 RestartSec=10
-WatchdogSec=120
 Environment=HOME=%h
 
 [Install]
 WantedBy=default.target
 ```
 
-Install via `systemctl --user enable --now <binary-name>.service`.
-**User units only** — don't install system-level services.
+Install via `systemctl --user daemon-reload && systemctl --user enable --now <binary-name>.service`.
+
+**`Type=simple` on purpose.** `Type=notify` requires the Go program to
+call `sd_notify(READY=1)` via `github.com/coreos/go-systemd/v22/daemon`;
+without that, the service hangs in `activating` and systemd kills it.
+If you genuinely need `notify` + `WatchdogSec`, add the go-systemd
+dependency and the notify calls, then flip the unit type.
+
+**User units only.** Don't install system-level services.
 
 ---
 
@@ -1038,16 +1378,38 @@ Install via `systemctl --user enable --now <binary-name>.service`.
   and `--version`.** If it unconditionally loads config, `--version`
   dies on a machine with no config. Always early-return on
   `version` / `help` / `completion`.
-- **SQLite without `busy_timeout` + `journal_mode=WAL`** → `database is
-  locked` in a daemon + CLI setup. Every time. Not optional.
+- **Cobra `PersistentPreRunE` inheritance: only the deepest override
+  in a command chain runs.** If a subcommand defines its own, the
+  root's is skipped. Your config/logger setup silently doesn't happen.
+- **SQLite pragmas via `db.Exec("PRAGMA ...")` only affect one pooled
+  connection.** Other connections revert to defaults → `database is
+  locked` under contention. Put pragmas in the DSN (`?_pragma=...`)
+  so every connection gets them.
+- **`modernc.org/sqlite` registers as `"sqlite"`**, not `"sqlite3"`
+  (which is mattn/CGO). `sql.Open("sqlite3", ...)` with only
+  `_ "modernc.org/sqlite"` fails "unknown driver".
+- **`modernc.org/sqlite` does NOT enable `PRAGMA foreign_keys=ON` by
+  default.** Add `&_pragma=foreign_keys(on)` to the DSN if you rely on
+  FK enforcement.
+- **`pgxpool.Pool.Close()` blocks on in-flight queries.** Daemons
+  need a time-bounded shutdown (goroutine + `time.After` race).
+- **`pgxpool.ParseConfig` silently ignores unknown DSN parameters.**
+  Validate the fields of the returned config, or typo'd options will
+  be invisible.
 - **`wrapcheck` false positives** when wrapping errors from your own
   helpers. Either add to `ignoreSigs` or return pre-wrapped.
 - **`httptest.NewServer` vs `NewTLSServer`** — if the client is
   hard-coded to HTTPS, the plain version gives an unhelpful
   "unknown protocol" error. Use the TLS variant.
 - **`go-chi`'s `Timeout` middleware doesn't cancel the handler's
-  work** — it only cancels the response write. If you have expensive
-  work, check `r.Context().Done()` yourself.
+  goroutine** — it only cancels the request context. If you have
+  expensive work, check `r.Context().Done()` yourself.
+- **`middleware.Recoverer` must come before `middleware.Timeout`.**
+  A panic inside a timed-out handler otherwise escapes Recoverer's
+  catch and crashes the process.
+- **`slog.TextHandler` and `JSONHandler` emit different time formats.**
+  Switching handler types mid-project breaks log ingesters that expect
+  a fixed shape.
 - **`signal.NotifyContext` only covers the current process.** If you
   `os/exec` a subprocess, propagate the context via
   `exec.CommandContext` or the child won't die on Ctrl-C.
@@ -1057,11 +1419,12 @@ Install via `systemctl --user enable --now <binary-name>.service`.
 - **`go build` without ldflags** produces a binary that reports
   `version dev (built unknown)`. Always build through the Makefile in
   local dev, or set `LDFLAGS` explicitly.
-- **`go test` without `-race`** passes locally but CI catches races.
-  Run `-race` locally too.
-- **Test parallelism + shared state.** `t.Parallel()` on tests that
-  mutate shared globals or touch the same DB will flake
-  nondeterministically. Either isolate state per test or don't
+- **`git describe` silently falls back to `"dev"` outside a git repo.**
+  Always `git init` first so your version string reflects reality.
+- **`go test` without `-race`** passes locally but can fail in CI.
+  The Makefile always passes `-race`; don't skip it.
+- **`t.Parallel()` + shared state** (mutated globals, shared DB)
+  flakes nondeterministically. Either isolate state per test or don't
   parallelize that test.
 
 ---
@@ -1070,37 +1433,47 @@ Install via `systemctl --user enable --now <binary-name>.service`.
 
 Work through in order. Each step has a template earlier in this doc.
 
-- [ ] Create repo, `go mod init github.com/<user>/<project>`
-- [ ] Pin Go version in CI (`GO_VERSION: '1.25'`)
-- [ ] `cmd/<name>/main.go` from §3 skeleton
-- [ ] `internal/config/config.go` with `Load()` + `DefaultConfigPath()` (§5)
-- [ ] `internal/logging/logging.go` if the one-liner slog isn't enough
+- [ ] `mkdir <project> && cd <project>`
+- [ ] `git init -b main`
+- [ ] `go mod init github.com/<user>/<project>`
+- [ ] Open `go.mod` and confirm/edit the `go` directive to `go 1.25`
+      (matches `GO_VERSION` in CI)
+- [ ] `mkdir -p cmd/<binary-name> internal/config .github/workflows`
+- [ ] `cmd/<binary-name>/main.go` from §3 skeleton (optionally with
+      the §4.2 subcommand example)
+- [ ] `internal/config/config.go` from §5 (replace `APP_` env prefix
+      and `<binary-name>` placeholder)
 - [ ] `.golangci.yml` from §11 verbatim
 - [ ] `Makefile` from §12, replace `<binary-name>`
 - [ ] `.github/workflows/ci.yml` from §13, replace `<binary-name>`
 - [ ] `.github/workflows/release.yml` if you plan to cut tagged releases
-- [ ] `.gitignore` covers:
-  ```gitignore
-  # Binaries
-  /bin/
-  /dist/
+- [ ] `.gitignore`:
+      ```gitignore
+      # Binaries
+      /bin/
+      /dist/
 
-  # Test / coverage output
-  coverage.out
-  coverage.html
-  *.test
+      # Test / coverage output
+      coverage.out
+      coverage.html
+      *.test
 
-  # Editor
-  .vscode/
-  .idea/
-  *.swp
+      # Editor
+      .vscode/
+      .idea/
+      *.swp
 
-  # OS
-  .DS_Store
-  ```
-- [ ] `README.md`: what it does, install, usage, config, dev
-- [ ] `LICENSE`
-- [ ] `make tools` to install dev tools
+      # OS
+      .DS_Store
+      ```
+- [ ] `README.md` — at minimum: what it does, install, usage, config,
+      dev. A one-page file is fine; long-form docs can live elsewhere.
+- [ ] `LICENSE` — pick one; MIT is the default for personal projects.
+- [ ] `go get github.com/spf13/cobra` (and any other deps you reference
+      in the skeleton)
+- [ ] `go mod tidy`
+- [ ] Ensure `~/.local/bin` is on `$PATH` if you want `make install-local`
+- [ ] `make tools` to install dev tools (goimports, golangci-lint@v1.64.8, gosec)
 - [ ] First commit should run `make ci` clean before push
 
 ---
@@ -1109,11 +1482,13 @@ Work through in order. Each step has a template earlier in this doc.
 
 - **Observability / metrics.** No canonical Prometheus pattern yet.
   Add when one exists.
-- **Secrets management.** Varies by environment (1Password `op` CLI,
-  Vault, AWS SM, plain env). Pick per-project; don't put secrets in
-  config files regardless.
+- **Secrets management.** Varies by environment (1Password CLI, Vault,
+  AWS SM, plain env). Pick per-project; don't put secrets in config
+  files regardless.
 - **Frontend / UI.** Out of scope.
 - **SQL migrations.** No preferred tool yet (golang-migrate vs sqlc vs
   atlas). Pick per-project, document in the project's README.
 - **Dockerfile.** Write one when you need it; no canonical template
   worth enforcing.
+- **Project-scaffolding script.** Copy-paste from this doc is the
+  canonical workflow. A cookiecutter is on the wishlist.
