@@ -12,13 +12,22 @@ relevant standards doc. Copy-paste is the intended workflow.
 
 More to be added as they prove themselves in real projects.
 
+## Process
+
+- [testing-standards.md](testing-standards.md) — how each language doc
+  in this repo is stress-tested (scaffold + adversarial review +
+  regression verification) before being promoted to "the standard."
+  Run this on any new language doc before publishing.
+
 ## How to use
 
 1. Start a new project from scratch? Work through the checklist at the
    end of the relevant language doc.
 2. Reviewing an existing project? Diff it section-by-section against
    the doc and open issues for gaps.
-3. Disagree with something? Open a PR — these are living documents.
+3. Adding a new language doc? Apply the process in
+   [testing-standards.md](testing-standards.md) before merging.
+4. Disagree with something? Open a PR — these are living documents.
 
 ## Principles
 
