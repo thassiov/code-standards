@@ -430,3 +430,55 @@ scripts) cause type-aware lint to throw. Add them to the eslint
 For JS config files that *are* linted, add an override applying
 `tseslint.configs.disableTypeChecked` so type-aware rules don't try to
 load them in the TS project.
+
+## 9. Reading the analysis: a Linus filter, not academic correctness
+
+The static stack is a tool, not the goal. When the gates fail, ask:
+
+1. **Is each moving part too complex for its job?**
+   The cyclomatic / cognitive / line gates flag candidates. They don't
+   *prove* anything is wrong. A 27-cognitive function that is a single
+   well-documented algorithm (e.g. a classifier walking a tree) can stay
+   if splitting hurts readability. A 22-cognitive function whose body
+   is "edit-mode if/else nest" is bleeding — split it. Use a per-file
+   override with a one-line comment when you keep complexity above the
+   gate; never silence globally.
+
+2. **Is the behavior DRY at the level that matters?**
+   `jscpd --min-tokens 25` reports textual duplication; type-aware
+   eslint can't catch most of it. *Production* duplicates worth
+   extracting are typically named functions or 5+ line JSX/handler
+   blocks. Test-fixture duplication (AAA setup, mocks, factories) is
+   noise — readable-in-isolation tests beat DRY tests. Don't chase
+   jscpd into the test directory.
+
+3. **Are responsibilities well-defined?**
+   The dependency-cruiser config (or the equivalent — a written rule of
+   "X may import Y, not Z") is the contract. If a layering rule has
+   to be loosened to make new code pass, that's almost always a sign
+   the new code is in the wrong layer, not that the rule is wrong.
+
+4. **Is each part testable in isolation AND as a component?**
+   A boundary module (service, repo, dispatcher) is testable in
+   isolation with an in-memory or fake collaborator at the next layer
+   down — never via mocks of internals. A component (UI block, bigger
+   wired-up piece) is testable as a unit when its public surface is
+   small and its dependencies are injectable. The smell is needing to
+   spin up the whole app to test a leaf.
+
+When a finding doesn't match one of these four, it's noise — disable
+the rule with a comment naming the trade-off, and capture the rule
+name in the "noise to disable up front" subsection of section 8.
+
+When a finding does match, the right move is to refactor, not to
+silence. The override is for *while* the refactor is being scheduled,
+not as a permanent home.
+
+### What to track and what to delete
+
+- A failing gate with a tracking ticket → per-file override + comment referencing the ticket.
+- A failing gate with no clear ticket → either fix it now or drop the rule (be honest).
+- A "noise" rule that fires on idiomatic code → disable in the shared config, add to the documented list with a one-line reason.
+- A rule that catches one real bug per quarter → keep it, accept the occasional false positive, write the tracking ticket.
+
+The stack should answer the question "what would I flag in code review if I had unlimited time?" without inventing problems that don't exist.
